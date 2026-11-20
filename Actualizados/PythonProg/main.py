@@ -1,3 +1,5 @@
+import os
+import json
 import time
 import cv2
 import numpy as np
@@ -6,10 +8,10 @@ from tensorflow.keras import models, layers
 from pyModbusTCP.client import ModbusClient
 
 # ==========================================
-# 1. CONEXIÓN WI-FI MODBUS TCP AL ESP32
+# 1. CONFIGURACIÓN MODBUS Y PERSISTENCIA JSON
 # ==========================================
-ESP32_IP = "192.168.1.100"  # <-- Pega aquí la IP que muestra el ESP32
 ESP32_PORT = 502
+ARCHIVO_CONFIG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config_esp32.json")
 
 REG_DISTANCIA = 100
 REG_PIEZAS_RACK = 101
@@ -17,15 +19,96 @@ REG_CONTADOR_TRAGAMONEDAS = 102
 REG_CONTROL_BANDA = 103
 REG_VELOCIDAD_BANDA = 104
 
-modbus = ModbusClient(host=ESP32_IP, port=ESP32_PORT, auto_open=True, timeout=0.5)
+def cargar_ip_guardada():
+    if os.path.exists(ARCHIVO_CONFIG):
+        try:
+            with open(ARCHIVO_CONFIG, "r", encoding="utf-8") as f:
+                datos = json.load(f)
+                ip = datos.get("esp32_ip", "").strip()
+                return ip if ip else None
+        except (json.JSONDecodeError, OSError):
+            return None
+    return None
 
-# Variables de estado
+def guardar_ip(ip):
+    try:
+        with open(ARCHIVO_CONFIG, "w", encoding="utf-8") as f:
+            json.dump({"esp32_ip": ip}, f, indent=4)
+        print(f"[CONFIG] IP {ip} guardada en {os.path.basename(ARCHIVO_CONFIG)}.")
+    except OSError as e:
+        print(f"[AVISO] No se pudo guardar el archivo JSON: {e}")
+
+def probar_conexion(ip):
+    cliente = ModbusClient(host=ip, port=ESP32_PORT, auto_open=False, timeout=2.0)
+    if cliente.open():
+        registros = cliente.read_holding_registers(REG_DISTANCIA, 4)
+        if registros is not None:
+            print(f"[OK] Conexión establecida con el ESP32 ({ip}).")
+            print(f"     Lectura inicial -> Distancia: {registros[0]} cm | Rack: {registros[1]} | Tragamonedas: {registros[2]}")
+            cliente.timeout = 0.5
+            cliente.auto_open = True
+            return cliente
+        cliente.close()
+    return None
+
+def conectar_esp32():
+    # Paso 1: Intentar conectar con la IP guardada en el JSON
+    ip_anterior = cargar_ip_guardada()
+    if ip_anterior:
+        print(f"\n[MODBUS] Comprobando IP guardada en JSON ({ip_anterior})...")
+        cliente = probar_conexion(ip_anterior)
+        if cliente is not None:
+            return cliente, ip_anterior
+        print(f"[AVISO] El ESP32 no respondió en la IP anterior ({ip_anterior}).")
+
+    # Paso 2: Si no hay JSON o falló la IP anterior, pedir una nueva
+    while True:
+        ip = input("\nIngresa la nueva IP del ESP32 (ej. 192.168.1.100): ").strip()
+        if not ip:
+            print("[AVISO] Debes escribir una dirección IP válida.")
+            continue
+
+        print(f"[MODBUS] Probando conexión con {ip}:{ESP32_PORT}...")
+        cliente = probar_conexion(ip)
+        if cliente is not None:
+            guardar_ip(ip)
+            return cliente, ip
+
+        print(f"[ERROR] No se pudo conectar a {ip}. Verifica la red INVESTIGADORES y vuelve a intentar.")
+
+# Verificar conexión antes de cargar la IA y la cámara
+modbus, ESP32_IP = conectar_esp32()
+
+# ==========================================
+# 2. CARGA DE RED NEURONAL BINARIA
+# ==========================================
+print("\n[IA] Cargando modelo neuronal...")
+
+ruta_local = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'modelo_cuadrados_binario.h5')
+ruta_respaldo = '/home/kevin/Documentos/redneuronal/ShapeDetector/modelo_cuadrados_binario.h5'
+ruta_modelo = ruta_local if os.path.exists(ruta_local) else ruta_respaldo
+
+model = models.Sequential([
+    layers.Input(shape=(200, 200, 1)),
+    layers.Conv2D(32, (3, 3), activation='relu'),
+    layers.MaxPooling2D((2, 2)),
+    layers.Flatten(),
+    layers.Dense(64, activation='relu'),
+    layers.Dense(1, activation='sigmoid')
+])
+
+model.load_weights(ruta_modelo)
+print(f"[IA] Pesos cargados desde: {ruta_modelo}")
+
+# ==========================================
+# 3. FUNCIONES DE CONTROL Y VARIABLES DE ESTADO
+# ==========================================
 distancia_rack = 0
 piezas_rack = 0
 contador_piezas = 0
 banda_en_marcha = False
 motivo_paro = "INICIO EN PARO (Presiona R)"
-modbus_conectado = False
+modbus_conectado = True
 ultimo_poll = 0.0
 INTERVALO_POLL = 0.15  # Lectura cada 150 ms
 
@@ -40,30 +123,23 @@ def enviar_orden_banda(arrancar, motivo=""):
         print("[ERROR WI-FI] No se pudo enviar orden al ESP32")
 
 # ==========================================
-# 2. RED NEURONAL BINARIA
+# 4. ENCENDER CÁMARA Y BUCLE PRINCIPAL
 # ==========================================
-model = models.Sequential([
-    layers.Input(shape=(200, 200, 1)),
-    layers.Conv2D(32, (3, 3), activation='relu'),
-    layers.MaxPooling2D((2, 2)),
-    layers.Flatten(),
-    layers.Dense(64, activation='relu'),
-    layers.Dense(1, activation='sigmoid')
-])
-
-model.load_weights('modelo_cuadrados_binario.h5')
-
-# ==========================================
-# 3. BUCLE DE CÁMARA Y CONTROL
-# ==========================================
+print("[CAMARA] Iniciando cámara USB...")
 cap = cv2.VideoCapture(1)
+if not cap.isOpened():
+    print("[AVISO] Cámara en índice 1 no disponible, intentando índice 0...")
+    cap = cv2.VideoCapture(0)
+
 cap.set(cv2.CAP_PROP_FOCUS, 85)
 
+# Iniciar con la banda detenida por seguridad
 enviar_orden_banda(False, "INICIO EN PARO (Presiona R)")
 
 while True:
     ret, frame = cap.read()
     if not ret:
+        print("[ERROR CAMARA] No se recibió imagen.")
         break
 
     # --- A. LECTURA DE SENSORES POR WI-FI ---

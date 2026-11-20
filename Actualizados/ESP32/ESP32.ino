@@ -36,16 +36,23 @@ String bufferTragamonedas = "";
 
 int ultimoEstadoBanda = -1;
 int ultimaVelocidad   = -1;
+unsigned long ultimoReporteIP = 0;
+
+void procesarUltrasonico(String dato);
+void procesarTragamonedas(String dato);
 
 void setup() {
   Serial.begin(115200);
+  delay(1500); // Da tiempo a que abra el Monitor Serial antes de imprimir
+
   Serial1.begin(115200, SERIAL_8N1, RX1_PIN, TX1_PIN);
   Serial2.begin(9600, SERIAL_8N1, RX2_PIN, TX2_PIN);
 
   WiFi.setHostname(HOSTNAME);
   WiFi.begin(SSID_WIFI, PASS_WIFI);
 
-  Serial.print("[ESP32] Conectando a INVESTIGADORES");
+  Serial.print("[ESP32] Conectando a ");
+  Serial.print(SSID_WIFI);
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
     Serial.print(".");
@@ -65,6 +72,13 @@ void setup() {
 
 void loop() {
   mb.task();
+
+  // --- REPORTE PERIÓDICO DE IP CADA 10 SEGUNDOS ---
+  if (millis() - ultimoReporteIP >= 10000) {
+    ultimoReporteIP = millis();
+    Serial.print("[ESP32] IP Wi-Fi activa: ");
+    Serial.println(WiFi.localIP());
+  }
 
   // --- 1. LEER ARDUINO 1 (ULTRASÓNICO) ---
   while (Serial1.available() > 0) {
@@ -113,7 +127,15 @@ void loop() {
 
 void procesarUltrasonico(String dato) {
   dato.trim();
-  if (dato.length() == 0 || !isDigit(dato.charAt(0))) return;
+  if (dato.length() == 0) return;
+
+  Serial.print("[Ultrasonico] Distancia: ");
+  Serial.print(dato);
+
+  if (!isDigit(dato.charAt(0))) {
+    Serial.println();
+    return;
+  }
 
   float distanciaDecimal = dato.toFloat();
   if (distanciaDecimal > 0) {
@@ -131,12 +153,22 @@ void procesarUltrasonico(String dato) {
 
     mb.Hreg(DISTANCIA_HREG, distanciaEntera);
     mb.Hreg(PIEZAS_RACK_HREG, PDi);
+
+    Serial.print(" cm | Piezas en rack: ");
+    Serial.println(PDi);
+  } else {
+    Serial.println();
   }
 }
 
 void procesarTragamonedas(String dato) {
   dato.trim();
-  if (dato.length() == 0 || !isDigit(dato.charAt(0))) return;
+  if (dato.length() == 0) return;
+
+  Serial.print("[Tragamonedas] Conteo: ");
+  Serial.println(dato);
+
+  if (!isDigit(dato.charAt(0))) return;
 
   long conteo = dato.toInt();
   mb.Hreg(CONTADOR_HREG, (uint16_t)conteo);
